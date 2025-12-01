@@ -10,7 +10,7 @@ GCC  = gcc
 all: $(TARGET)
 
 $(TARGET): nbody.o compute.o
-	$(NVCC) $(FLAGS) $^ -o $@ $(LIBS)
+	$(NVCC) $(FLAGS) $^ -o $@ $(LIBS) -lcudart
 
 nbody.o: nbody.c planets.h config.h vector.h $(ALWAYS_REBUILD)
 	$(GCC) $(FLAGS) -c $<
