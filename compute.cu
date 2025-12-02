@@ -1,170 +1,100 @@
-#include <cuda_runtime.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include "vector.h"
 #include "config.h"
+#include "compute.h"
+#include <stdio.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+extern vector3 **d_accel, *d_hPos, *d_hVel, *d_accel_sum;
+extern double *d_mass;
 
-#define CUDA_CHECK(call) \
-{ \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(EXIT_FAILURE); \
-    } \
+//compute: Updates the positions and locations of the objects in the system based on gravity.
+//Parameters: None
+//Returns: None
+//Side Effect: Modifies the hPos and hVel arrays with the new positions and accelerations after 1 INTERVAL
+void compute() {
+	int numBlocksPerDim = (NUMENTITIES + 7) / 8;
+	dim3 computeAccelsTPB(8, 8, 3);
+	dim3 computeAccelsBlocks(numBlocksPerDim, numBlocksPerDim);
+
+	computeAccels<<<computeAccelsBlocks, computeAccelsTPB>>>(d_accel, d_hPos, d_mass);
+
+	int sumColsTPB = 32;
+	dim3 sumColsBlocks(NUMENTITIES, 3);
+	int sumColsSharedMem = sumColsTPB * sizeof(double) * 2;
+
+	sumCols<<<sumColsBlocks, sumColsTPB, sumColsSharedMem>>>(d_accel, d_accel_sum);
+    
+    int updatePosBlockDim = (NUMENTITIES + 7) / 8;
+	dim3 updatePosTPB(8, 3);
+
+	updatePos<<<updatePosBlockDim, updatePosTPB>>>(d_accel_sum, d_hPos, d_hVel);
+
 }
 
-vector3 *d_hPos = NULL;
-vector3 *d_hVel = NULL;
-double *d_mass = NULL;
-vector3 *d_accels = NULL;
-
-/*__global__ void computeAccelsKernel(vector3 *pos,
-                                   double *mass,
-                                   vector3 *accels,
-                                   int N)
-{
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i >= N || j >= N) return;
-
-    int idx = i * N + j;
-
+__global__ void computeAccels(vector3** d_accel, vector3* d_hPos, double* d_mass){
+	int i = threadIdx.x + blockIdx.x * blockDim.x;
+	int j = threadIdx.y + blockIdx.y * blockDim.y;
+	int k = threadIdx.z;
+	__shared__ vector3 shDistance[8][8];
+	if (i >= NUMENTITIES || j >= NUMENTITIES) return;
     if (i == j) {
-        accels[idx][0] = 0;
-        accels[idx][1] = 0;
-        accels[idx][2] = 0;
-        return;
-    }
+		d_accel[i][j][k] = 0;
+	} else {
+		shDistance[threadIdx.x][threadIdx.y][k] = d_hPos[i][k] - d_hPos[j][k];
 
-    double dx = pos[i][0] - pos[j][0];
-    double dy = pos[i][1] - pos[j][1];
-    double dz = pos[i][2] - pos[j][2];
+		__syncthreads();
 
-    double distSq = dx*dx + dy*dy + dz*dz;
-    double dist   = sqrt(distSq);
+		double magnitude_sq = shDistance[threadIdx.x][threadIdx.y][0] * shDistance[threadIdx.x][threadIdx.y][0] + shDistance[threadIdx.x][threadIdx.y][1] * shDistance[threadIdx.x][threadIdx.y][1] + shDistance[threadIdx.x][threadIdx.y][2] * shDistance[threadIdx.x][threadIdx.y][2];
+		double magnitude = sqrt(magnitude_sq);
+		double accelmag = -1 * GRAV_CONSTANT * d_mass[j] / magnitude_sq;
 
-    double accelMag = -GRAV_CONSTANT * mass[j] / distSq;
-
-    accels[idx][0] = accelMag * dx / dist;
-    accels[idx][1] = accelMag * dy / dist;
-    accels[idx][2] = accelMag * dz / dist;
-}
-*/
-__global__ void computeAccelsSharedKernel(vector3 *pos, double *mass, vector3 *accels, int N)
-{
-    extern __shared__ double sharedData[];
-    vector3 *sharedPos = (vector3*)sharedData;
-    double *sharedMass = (double*)&sharedPos[blockDim.x];
-    
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
-    
-    for (int tile = 0; tile < gridDim.x; tile++) {
-        int loadIdx = tile * blockDim.x + tx;
-        if (loadIdx < N) {
-            sharedPos[tx][0] = pos[loadIdx][0];
-            sharedPos[tx][1] = pos[loadIdx][1];
-            sharedPos[tx][2] = pos[loadIdx][2];
-            sharedMass[tx] = mass[loadIdx];
-        }
-        __syncthreads();
-        
-        int i = by * blockDim.y + ty;
-        int j = tile * blockDim.x + tx;
-        
-        if (i < N && j < N && tx < blockDim.x) {
-            int idx = i * N + j;
-            
-            if (i == j) {
-                accels[idx][0] = accels[idx][1] = accels[idx][2] = 0;
-            } else {
-                double dx = pos[i][0] - sharedPos[tx][0];
-                double dy = pos[i][1] - sharedPos[tx][1];
-                double dz = pos[i][2] - sharedPos[tx][2];
-                
-                double distSq = dx*dx + dy*dy + dz*dz;
-                double dist = sqrt(distSq);
-                
-                double accelMag = -GRAV_CONSTANT * sharedMass[tx] / distSq;
-                
-                accels[idx][0] = accelMag * dx / dist;
-                accels[idx][1] = accelMag * dy / dist;
-                accels[idx][2] = accelMag * dz / dist;
-            }
-        }
-        __syncthreads();
-    }
+		d_accel[i][j][k] = accelmag * shDistance[threadIdx.x][threadIdx.y][k] / magnitude;
+	}
 }
 
-__global__ void updateMotionKernel(vector3 *accels,
-                                   vector3 *vel,
-                                   vector3 *pos,
-                                   int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-
-    vector3 accelSum = {0,0,0};
-
-    for (int j = 0; j < N; j++) {
-        int idx = i * N + j;
-        accelSum[0] += accels[idx][0];
-        accelSum[1] += accels[idx][1];
-        accelSum[2] += accels[idx][2];
-    }
-
-    vel[i][0] += accelSum[0] * INTERVAL;
-    vel[i][1] += accelSum[1] * INTERVAL;
-    vel[i][2] += accelSum[2] * INTERVAL;
-
-    pos[i][0] += vel[i][0] * INTERVAL;
-    pos[i][1] += vel[i][1] * INTERVAL;
-    pos[i][2] += vel[i][2] * INTERVAL;
+__global__ void sumCols(vector3** d_accel, vector3* d_accel_sum){
+	int row = threadIdx.x;
+	int col = blockIdx.x; 
+	int dim = blockIdx.y;
+	extern __shared__ double shArr[];
+	__shared__ int offset;
+	int blocksize = blockDim.x;
+	int arrSize = NUMENTITIES;
+	shArr[row] = row < arrSize ? d_accel[col][row][dim] : 0;
+	if (row == 0) {
+		offset = blocksize;
+	}
+	__syncthreads();
+	while (offset < arrSize) {
+		shArr[row+blocksize] = row+blocksize < arrSize ? d_accel[col][row+offset][dim] : 0;
+		__syncthreads();
+		if (row == 0) {
+			offset += blocksize;
+		}
+		double sum = shArr[2*row] + shArr[2*row+1];
+		__syncthreads();
+		shArr[row] = sum;
+	}
+	__syncthreads();
+	for (int stride = 1; stride < blocksize; stride *= 2) {
+		int arrIdx = row*stride*2;
+		if (arrIdx + stride < blocksize) {
+			shArr[arrIdx] += shArr[arrIdx + stride];
+		}
+		__syncthreads();
+	}
+	if (row == 0) {
+		d_accel_sum[col][dim] = shArr[0];
+	}
 }
 
-void compute()
-{
-    int N = NUMENTITIES;
+__global__ void updatePos(vector3* accel_sum, vector3* hPos, vector3* hVel) {
+	int i = threadIdx.x + blockIdx.x * blockDim.x;
+	int j = threadIdx.y;
 
-    static int firstCall = 1;
-    if (firstCall) {
-        CUDA_CHECK(cudaMalloc((void**)&d_hPos, sizeof(vector3)*N));
-        CUDA_CHECK(cudaMalloc((void**)&d_hVel, sizeof(vector3)*N));
-        CUDA_CHECK(cudaMalloc((void**)&d_mass, sizeof(double)*N));
-        CUDA_CHECK(cudaMalloc((void**)&d_accels, sizeof(vector3)*N*N));
+	if (i >= NUMENTITIES) return;
 
-        CUDA_CHECK(cudaMemcpy(d_hPos, hPos, sizeof(vector3)*N, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_hVel, hVel, sizeof(vector3)*N, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_mass, mass, sizeof(double)*N, cudaMemcpyHostToDevice));
-
-        firstCall = 0;
-    }
-
-    dim3 blockSize(16,16);
-    dim3 gridSize( (N+15)/16, (N+15)/16 );
-    //computeAccelsKernel<<<gridSize, blockSize>>>(d_hPos, d_mass, d_accels, N);
-    size_t sharedMemSize = (sizeof(vector3) * blockSize.x + sizeof(double) * blockSize.x);
-    computeAccelsSharedKernel<<<gridSize, blockSize, sharedMemSize>>>(d_hPos, d_mass, d_accels, N);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize()); 
-
-    int threads = 256;
-    int blocks  = (N + threads - 1) / threads;
-    updateMotionKernel<<<blocks, threads>>>(d_accels, d_hVel, d_hPos, N);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(hPos, d_hPos, sizeof(vector3)*N, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hVel, d_hVel, sizeof(vector3)*N, cudaMemcpyDeviceToHost));
+	hVel[i][j] += accel_sum[i][j] * INTERVAL;
+	hPos[i][j] += hVel[i][j] * INTERVAL;
 }
-
-#ifdef __cplusplus
-}
-#endif

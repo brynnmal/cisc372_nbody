@@ -1,3 +1,7 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#include <math.h>
 
 #ifndef __CONFIG_H__
 #define __CONFIG_H__
